@@ -1,0 +1,306 @@
+package main
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/getlantern/systray"
+	"github.com/getlantern/systray/example/icon"
+	"github.com/gorilla/websocket"
+	"github.com/jacobsa/go-serial/serial"
+	"github.com/joho/godotenv"
+	"github.com/zserge/lorca"
+)
+
+var server string;
+var mac string;
+var ipaddr string;
+
+var addr = flag.String("addr", "tric.kr:8081", "http service address")
+
+func myWS() {
+   flag.Parse()
+   log.SetFlags(0)
+
+   u := url.URL{Scheme: "ws", Host: *addr, Path: "/"}
+
+   c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+   if err != nil {
+      log.Fatal("dial:", err)
+   }
+   log.Printf("[log] connected to %s", u.String())
+
+   defer c.Close()
+
+   done := make(chan struct{})
+
+   go func() {
+      defer close(done)
+      for {
+         _, message, err := c.ReadMessage()
+         if err != nil {
+            log.Println("read:", err)
+            return
+         }
+         testWebview(string(message[:]))
+         log.Printf("[log] received message: %s", message)
+      }
+   }()
+   ticker := time.NewTicker(time.Second)
+   defer ticker.Stop()
+
+   for {
+      select {
+      case <-done:
+         return
+      }
+   }
+}
+
+func GetOutboundIP() net.IP {
+   conn, err := net.Dial("udp", "8.8.8.8:80")
+   if err != nil { log.Fatal(err) }
+   defer conn.Close()
+   return conn.LocalAddr().(*net.UDPAddr).IP
+}
+
+func GetOutboundMac(currentIP string) string {
+   var currentNetworkHardwareName string
+   interfaces, _ := net.Interfaces()
+   for _, interf := range interfaces {
+      if addrs, err := interf.Addrs(); err == nil {
+         for _, addr := range addrs {
+            if strings.Contains(addr.String(), currentIP) { currentNetworkHardwareName = interf.Name }
+         }
+      }
+   }
+   netInterface, err := net.InterfaceByName(currentNetworkHardwareName)
+   if err != nil { fmt.Println(err) }
+   return netInterface.HardwareAddr.String()
+}
+
+func getConfig () {
+   err := godotenv.Load()
+   if err != nil {
+     log.Fatal("Error loading .env file")
+   }
+   server = os.Getenv("SERVER")
+   ipaddr = GetOutboundIP().String()
+   mac    = GetOutboundMac(ipaddr)
+   log.Printf("- https server : %s", server)
+   log.Printf("- mac address  : %s", mac)
+   log.Printf("- ip address   : %s", ipaddr)
+
+   d := JsonData{Mac: mac, Timestamp: time.Now().Unix()}
+   b, _ := json.Marshal(d)
+   resp, err := http.Post(server + "/mac/" + mac, "application/json", bytes.NewBuffer(b))
+}
+
+////////////////////////////////////////////////////////////////////////////
+
+type JsonData struct {
+   Data      string
+   Timestamp int64
+}
+
+func Open(device string) io.ReadWriteCloser {
+   options := serial.OpenOptions{
+      PortName:        device,
+      BaudRate:        19200,
+      DataBits:        8,
+      StopBits:        1,
+      MinimumReadSize: 4,
+   }
+   port, err := serial.Open(options)
+   if err != nil { log.Printf("serial.Open: %v", err) }
+   return port
+}
+
+func Run(in io.ReadWriteCloser, out io.ReadWriteCloser) {
+   for {
+      buf := make([]byte, 4096)
+      n, err := in.Read(buf)
+
+      if err != nil {
+         if err != io.EOF { log.Fatal("[err] reading from serial port: ", err) }
+      } else {
+         buf = buf[:n]
+         if n > 0 {
+            d := JsonData{Data: hex.EncodeToString(buf), Timestamp: time.Now().Unix()}
+            b, _ := json.Marshal(d)
+            resp, err := http.Post("https://tric.kr/receipt/probe/1234", "application/json", bytes.NewBuffer(b))
+            if err != nil {
+               log.Printf("Error: ", err)
+            } else {
+               defer resp.Body.Close()
+               if resp.StatusCode == http.StatusOK {
+                  s, err := ioutil.ReadAll(resp.Body)
+                  if err == nil {
+                     b, _ = hex.DecodeString(string(s))
+                     log.Printf("output")
+                     fmt.Println(b)
+                     out.Write(b)
+                  } else {
+                     log.Printf("Error: ", err)
+                  }
+               }
+            }
+         }
+         //out.Write(buf)
+      }
+   }
+}
+
+func testWebview(d string) {
+   header := `
+   <html>
+     <head>
+     <title>Coupon</title>
+     <body>
+     <hi>Coupon Detected</h1>
+     <form role="form" action="https://tric.kr/using/coupon" method="post" class="login-form" enctype="application/json">
+     <input type="hidden" name="cpcode" value="`
+   footer := `">
+        <button type="submit">Check your coupon</button>
+      </form>
+     </body>
+   </html>
+   `
+   html := header + d + footer
+   // Create UI with basic HTML passed via data URI
+   /*
+      ui, err := lorca.New("data:text/html,"+url.PathEscape(`
+      <html>
+         <head><title>Hello</title></head>
+         <body><h1>Hello, world!</h1></body>
+      </html>
+      `), "", 480, 320)
+   */
+   ui, err := lorca.New("data:text/html,"+url.PathEscape(html), "", 480, 320)
+   if err != nil {
+      log.Fatal(err)
+   }
+   defer ui.Close()
+   // Wait until UI window is closed
+   <-ui.Done()
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// Declaration
+//
+var logo = ` 
+========================== 
+Hancom smart receipt agent 
+========================== 
+`
+var title = "hancom agent"
+
+func onReady() {
+   systray.SetTemplateIcon(icon.Data, icon.Data)
+   systray.SetTitle(title)
+   systray.SetTooltip(title)
+   mSetting := systray.AddMenuItem("Setting", "Setting agent")
+   mQuit := systray.AddMenuItem("Quit", "Quit agent")
+   go func() {
+      <-mQuit.ClickedCh
+      systray.Quit()
+      log.Printf("[log] systray termination.")
+   }()
+
+   for {
+      select {
+      case <-mSetting.ClickedCh:
+         /*
+                     html := `<html>
+                     <head><title>Hello</title></head>
+                     <body><h1>Hello, world!</h1></body>
+                     </html>`
+         */
+         testWebview("CP12345")
+         //open.Run("https://tric.kr/agent/setting/" + mac)
+      case <-mQuit.ClickedCh:
+         systray.Quit()
+         return
+      }
+   }
+}
+
+func mySystray() {
+   onExit := func() {}
+   systray.Run(onReady, onExit)
+}
+
+func main() {
+   getConfig()
+   //log.Printf("[log] server is %s", server)
+   var wg sync.WaitGroup
+
+   flag.Parse()
+   log.SetFlags(0)
+
+   log.Printf(logo)
+
+   go myWS()
+   wg.Add(1)
+   go mySystray()
+   wg.Add(1)
+
+   in := Open("COM2")
+   out := Open("COM1")
+
+   go Run(in, out)
+   go Run(out, in)
+   wg.Add(2)
+
+   wg.Wait()
+   /*
+         u := url.URL{Scheme: "ws", Host: *addr, Path: "/"}
+         log.Printf("[log] connecting to %s", u.String())
+
+         c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+         if err != nil {
+            log.Fatal("[err] dial:", err)
+         }
+         log.Printf("[log] connected.")
+
+         defer c.Close()
+
+         done := make(chan struct{})
+
+         go func() {
+            defer close(done)
+            for {
+               _, message, err := c.ReadMessage()
+               if err != nil {
+                  log.Fatal("[err] read:", err)
+                  return
+               }
+               //testWebview(string(message[:]))
+               log.Printf("[log] received message: %s", message)
+         }
+         }()
+         ticker := time.NewTicker(time.Second)
+         defer ticker.Stop()
+
+         for {
+            select {
+            case <-done:
+               return
+            }
+         }
+   */
+}
